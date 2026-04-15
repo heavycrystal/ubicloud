@@ -420,17 +420,39 @@ class Prog::Vm::Aws::Nexus < Prog::Base
   end
 
   def retry_in_different_az(e)
-    if (retry_count = frame["retry_count"] || 0) >= 5
+    retry_count = frame["retry_count"] || 0
+    azs_excluded = ((nic.strand.stack.first["exclude_availability_zones"] || []) + [nic.nic_aws_resource.subnet_az]).uniq
+    total_azs = nic.private_subnet.private_subnet_aws_resource.aws_subnets.count
+    all_azs_tried = azs_excluded.size >= total_azs
+
+    if retry_count >= 5 || all_azs_tried
+      if try_postgres_family_fallback
+        update_stack({"exclude_availability_zones" => nil, "retry_count" => 0})
+        nap 0
+      end
+
       Clog.emit("resetting excluding azs to retry", {retry_different_az_failed: {vm:, error: e.class.name, message: e.message, retry_count:}})
       update_stack({"exclude_availability_zones" => nil, "retry_count" => 0})
       nap 5 * 60
     end
 
     Clog.emit("retrying in different az", {retry_different_az: {vm:, error: e.class.name, message: e.message, retry_count: retry_count + 1}})
-    azs_excluded = ((nic.strand.stack.first["exclude_availability_zones"] || []) + [nic.nic_aws_resource.subnet_az]).uniq
     update_stack({"exclude_availability_zones" => azs_excluded, "retry_count" => retry_count + 1})
     nic.incr_destroy
     hop_wait_old_nic_deleted
+  end
+
+  def try_postgres_family_fallback
+    ps = PostgresServer[vm_id: vm.id]
+    return false unless ps&.fallback_eligible?
+
+    next_family = (Option::POSTGRES_FAMILY_FALLBACK_RINGS[vm.family] || [])
+      .find { Option::POSTGRES_SIZE_OPTIONS[Option.aws_instance_type_name(it, vm.vcpus)] }
+    return false unless next_family && next_family != vm.family
+
+    Clog.emit("postgres az exhausted, trying fallback family", {postgres_family_fallback: {vm:, from: vm.family, to: next_family}})
+    vm.update(family: next_family)
+    true
   end
 
   def ignore_invalid_entity

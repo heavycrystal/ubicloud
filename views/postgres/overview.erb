@@ -34,7 +34,7 @@ vm = @pg.representative_server.vm
     end
 
     [
-      ["hero-cpu-chip", @pg.vm_size, "#{vm.vcpus} vCPU, #{vm.memory_gib} GB RAM"],
+      ["hero-cpu-chip", @pg.vm_size, "#{vm.vcpus} vCPU, #{vm.memory_gib} GB RAM#{@pg.representative_server.on_intended_type? ? "" : " (Fallback — intended: #{@pg.target_vm_size})"}"],
       ["hero-circle-stack", "#{@pg.representative_server.storage_size_gib} GB", disk_usage_subtext],
       ["hero-square-2-stack-modified", ha_option.description, ""],
       ["hero-map-pin", @pg.location.display_name, h("#{location_details} (#{provider})")],

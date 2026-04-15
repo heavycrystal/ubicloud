@@ -41,6 +41,13 @@ module Option
   end
 
   AWS_FAMILY_OPTIONS = ["c6gd", "m6a", "m6id", "m6gd", "m7a", "m7i", "m7g", "m8g", "m8gd", "i8g", "i8ge", "i7i", "i7ie", "r8gd", "r6gd", "r6id"].freeze
+
+  POSTGRES_FAMILY_FALLBACK_RINGS = {
+    "r8gd" => ["r6gd"],
+    "r6gd" => ["r8gd"],
+    "m8gd" => ["m6gd"],
+    "m6gd" => ["m8gd"]
+  }.freeze
   non_storage_optimized_vm_storage_size_options = {1 => [59], 2 => [118], 4 => [237], 8 => [474], 16 => [950], 32 => [1900], 48 => [2850], 64 => [3800], 96 => [5700], 128 => [7600], 192 => [11400]}
   AWS_STORAGE_SIZE_OPTIONS = {
     "c6gd" => non_storage_optimized_vm_storage_size_options,

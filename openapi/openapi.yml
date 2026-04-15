@@ -3113,6 +3113,9 @@ components:
           description: Parent Postgres database
           type: string
           nullable: true
+        fallback_active:
+          description: Whether any server is running on a fallback instance type
+          type: boolean
         tags:
           description: Tags of the Postgres database
           type: array
@@ -3137,6 +3140,7 @@ components:
         - vm_size
         - maintenance_window_start_at
         - read_replica
+        - fallback_active
         - tags
         - created_at
     PostgresDatabaseMetrics:
@@ -3231,6 +3235,16 @@ components:
           enum:
             - ready
             - catching_up
+        vm_size:
+          description: Actual VM size of the server
+          type: string
+        target_vm_size:
+          description: Intended VM size for this server
+          type: string
+          nullable: true
+        on_intended_type:
+          description: Whether the server is running on its intended instance type
+          type: boolean
         vm:
           $ref: '#/components/schemas/Vm'
       additionalProperties: false
