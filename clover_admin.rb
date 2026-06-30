@@ -603,7 +603,7 @@ class CloverAdmin < Roda
       case column
       when :name, :ubid, :invoice_number
         link.call(obj, label: column)
-      when :project, :location, :vm_host, :billing_info, :resource, :parent, :installation
+      when :project, :location, :vm_host, :billing_info, :resource, :parent, :installation, :postgres_server
         link.call(obj.send(column))
       when :vm
         link.call(obj.send(column), label: :ubid)
@@ -852,6 +852,28 @@ class CloverAdmin < Roda
         case column
         when :resource
           ubid_uuid_grep.call(ds, :resource_id, value)
+        else
+          framework
+        end
+      end
+    end
+
+    model PostgresServerExtension do
+      order [:postgres_server_id, :name]
+      eager [:postgres_server]
+      columns do |type_symbol, request|
+        cs = [:postgres_server, :name, :state, :installed_version, :last_transition_at, :last_error]
+        cs.prepend(:ubid) unless type_symbol == :search_form
+        cs
+      end
+      column_options postgres_server: ubid_input.call("PostgresServer"),
+        state: {type: "select", options: %w[pending installing sync_pending restart_pending ready failed], add_blank: true},
+        last_transition_at: {type: "text"}
+
+      column_search_filter do |ds, column, value|
+        case column
+        when :postgres_server
+          ubid_uuid_grep.call(ds, :postgres_server_id, value)
         else
           framework
         end

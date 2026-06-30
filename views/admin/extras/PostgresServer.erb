@@ -21,6 +21,23 @@ replay_points = query_metric.call(tsdb_client, Metrics::ADMIN_POSTGRES_METRICS[:
 nonce = SecureRandom.hex(32)
 content_security_policy.add_img_src [:nonce, nonce] %>
 
+<p><a href="/autoforme/PostgresServerExtension/search/1?postgres_server=<%= obj.ubid %>">Extensions for this server</a></p>
+
+<%# TODO: remove the inline extensions table once standalone view is the only path %>
+<%== part("components/table",
+  title: "Extensions (TODO: remove, use standalone view)",
+  table_class: "object-table",
+  data: obj.extensions_dataset.order(:name).all.map { |e|
+    {
+      "Name" => e.name,
+      "State" => e.state,
+      "Installed Version" => e.installed_version,
+      "Last Transition" => e.last_transition_at&.strftime("%F %T"),
+      "Last Error" => e.last_error
+    }
+  }
+) %>
+
 <div class="chart-grid">
   <div class="chart-cell">
     <h3>Archival Backlog</h3>

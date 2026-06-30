@@ -28,6 +28,7 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
     end
 
     DB.transaction do
+      desired_extensions, extension_config = {}, {}
       superuser_password, timeline_id, timeline_access, target_version = if parent_id.nil?
         [SecureRandom.urlsafe_base64(15), Prog::Postgres::PostgresTimelineNexus.assemble(location_id: location.id).id, "push", target_version]
       else
@@ -48,6 +49,7 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
               latest_restore_time && restore_target <= latest_restore_time
             fail Validation::ValidationFailed.new({restore_target: "Restore target must be between #{earliest_restore_time} and #{latest_restore_time}"})
           end
+          desired_extensions, extension_config = parent.desired_extensions, parent.extension_config
         end
         [parent.superuser_password, parent.timeline.id, "fetch", parent.version]
       end
@@ -79,7 +81,8 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
       postgres_resource = PostgresResource.create_with_id(postgres_resource_id,
         project_id:, location_id: location.id, name:,
         target_vm_size:, target_storage_size_gib:, server_cert:, server_cert_key:,
-        superuser_password:, ha_type:, target_version:, flavor:, parent_id:, tags:, restore_target:, hostname_version:, user_config:, pgbouncer_user_config:)
+        superuser_password:, ha_type:, target_version:, flavor:, parent_id:, tags:, restore_target:,
+        hostname_version:, user_config:, pgbouncer_user_config:, desired_extensions:, extension_config:)
 
       if need_initial_cert_id
         strand_args[:stack][0]["initial_cert_id"] = Prog::Vnet::CertNexus.assemble(
@@ -348,6 +351,14 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
       postgres_resource.handle_storage_auto_scale
     end
 
+    when_converge_extensions_set? do
+      hop_converge_extensions
+    end
+
+    # RR resource strand skips extension convergence; parent drives it via cluster_servers.
+    # Failed rows park here until an explicit converge bump (semaphore handler above) retries.
+    hop_converge_extensions unless postgres_resource.read_replica? || postgres_resource.fully_converged? || postgres_resource.has_failed_extension_row?
+
     refresh = false
     if postgres_resource.certificate_last_checked_at < Time.now - 60 * 60 * 24 * (use_publicly_signed_certificates? ? 7 : 30)
       refresh = true
@@ -361,6 +372,71 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
     end
 
     nap 30
+  end
+
+  label def converge_extensions
+    register_deadline("wait", 60 * 60)
+    decr_converge_extensions
+    hop_wait if postgres_resource.read_replica?
+    # Bumping converge is the retry path: clear any prior failed rows so the
+    # walker re-creates them as pending. Operator does not touch row state.
+    PostgresServerExtension
+      .where(postgres_server_id: postgres_resource.cluster_servers.map(&:id), state: "failed")
+      .all.each(&:destroy)
+    postgres_resource.cluster_servers.reject(&:primary?).each(&:incr_process_extensions)
+    hop_watch_extension_apply
+  end
+
+  label def watch_extension_apply
+    when_converge_extensions_set? do
+      hop_converge_extensions
+    end
+
+    if postgres_resource.has_stalled_extension_row?
+      Prog::PageNexus.assemble(
+        "watch_extension_apply stuck on #{postgres_resource.ubid}",
+        ["watch_extension_apply", postgres_resource.id],
+        postgres_resource.ubid,
+      )
+    end
+
+    restart_ids = postgres_resource.cluster_server_ids_needing_restart
+    process_ids = postgres_resource.cluster_server_ids_needing_bump + restart_ids
+    already_pending = Semaphore.where(strand_id: process_ids, name: "process_extensions").select_map(:strand_id)
+    Semaphore.incr(process_ids - already_pending, "process_extensions")
+
+    already_restart_pending = Semaphore.where(strand_id: restart_ids, name: "restart").select_map(:strand_id)
+    Semaphore.incr(restart_ids - already_restart_pending, "restart")
+
+    hop_trigger_extension_configure if postgres_resource.should_trigger_extension_configure?
+    hop_wait if postgres_resource.fully_converged? ||
+      (postgres_resource.has_failed_extension_row? && !postgres_resource.has_active_extension_work?)
+
+    nap 5
+  end
+
+  label def trigger_extension_configure
+    cluster_server_ids = postgres_resource.cluster_servers.map(&:id)
+    extension_config = postgres_resource.effective_extension_config
+
+    DB.transaction do
+      postgres_resource.effective_desired_extensions.each do |name, version|
+        next unless extension_config.dig(name, "!version") == version
+        rows = PostgresServerExtension.where(
+          postgres_server_id: cluster_server_ids,
+          name:,
+          state: "sync_pending",
+          installed_version: version,
+        )
+        next if rows.empty?
+        next_state = extension_config.dig(name, "!needs_restart") ? "restart_pending" : "ready"
+        Clog.emit("TODO remove: cluster barrier promote sync_pending -> #{next_state}", {resource: postgres_resource.ubid, ext: name, count: rows.count})
+        rows.update(state: next_state, last_transition_at: Time.now)
+      end
+      Semaphore.incr(cluster_server_ids, "configure")
+    end
+
+    hop_watch_extension_apply
   end
 
   label def destroy

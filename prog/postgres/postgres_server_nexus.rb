@@ -461,8 +461,11 @@ CONFIG
 
       when_initial_provisioning_set? do
         hop_update_superuser_password if postgres_server.primary?
-        hop_wait_catch_up if postgres_server.standby? || postgres_server.read_replica?
-        hop_wait_recovery_completion
+        # PITR rep skips extension convergence during recovery; once
+        # switch_to_new_timeline makes it primary, normal root-resource
+        # convergence installs with role=primary from the start.
+        hop_wait_recovery_completion if postgres_server.is_representative && resource.restore_target && !postgres_server.primary?
+        hop_wait_extensions_converged
       end
 
       hop_wait_catch_up if postgres_server.standby? && postgres_server.synchronization_status != "ready"
@@ -630,6 +633,27 @@ SQL
     nap 5
   end
 
+  label def wait_extensions_converged
+    register_deadline("wait", 60 * 60)
+
+    when_configure_set? do
+      decr_configure
+      hop_configure
+    end
+
+    when_restart_set? do
+      drive_restart
+    end
+
+    process_extensions if postgres_server.needs_extension_converge?
+
+    unless postgres_server.needs_extension_converge?
+      hop_wait_catch_up if postgres_server.standby? || postgres_server.read_replica?
+      hop_wait_recovery_completion
+    end
+    nap 5
+  end
+
   label def wait
     decr_initial_provisioning
 
@@ -674,12 +698,7 @@ SQL
     end
 
     when_restart_set? do
-      register_deadline("complete_restart", 2 * 60)
-      if daemonized_restart
-        decr_restart
-        unregister_deadline("complete_restart")
-      end
-      nap 1
+      drive_restart
     end
 
     when_configure_metrics_set? do
@@ -716,6 +735,11 @@ SQL
       decr_configure_s3_new_timeline
       postgres_server.attach_s3_policy_if_needed
       postgres_server.refresh_walg_credentials
+    end
+
+    when_process_extensions_set? do
+      decr_process_extensions
+      process_extensions
     end
 
     if postgres_server.read_replica? && resource.parent
@@ -919,6 +943,121 @@ SQL
     nap 5
   end
 
+  def process_extensions
+    desired = resource.effective_desired_extensions
+    existing_names = PostgresServerExtension.where(postgres_server_id: postgres_server.id).select_map(:name)
+    (desired.keys - existing_names).each do |name|
+      PostgresServerExtension.create(postgres_server_id: postgres_server.id, name:, state: "pending", last_transition_at: Time.now)
+    end
+
+    PostgresServerExtension.where(postgres_server_id: postgres_server.id).all.each do |row|
+      version = desired[row.name]
+      next if version.nil?
+
+      case row.state
+      when "pending"
+        next if postgres_server.primary? && !resource.read_replica? &&
+          !resource.representative_install_unblocked?(row.name, version)
+
+        Clog.emit("TODO remove: extension walker pending -> installing", {server: postgres_server.ubid, ext: row.name, version:})
+        vm.sshable.d_run(extension_unit_name(row.name, "install"), *extension_install_command(row.name, version, "install"))
+        row.update(state: "installing", last_transition_at: Time.now, last_error: nil)
+      when "installing"
+        poll_extension_phase(row, version, "install")
+      when "sync_pending"
+        # Primary re-fires install when extension_config !version is missing or stale;
+        # barrier won't promote until it matches the desired version.
+        ext_version = resource.extension_config.dig(row.name, "!version")
+        if postgres_server.primary? && !resource.read_replica? && ext_version != version
+          Clog.emit("TODO remove: extension walker sync_pending re-fire (primary, stale !version)", {server: postgres_server.ubid, ext: row.name, ext_version:, desired: version})
+          vm.sshable.d_run(extension_unit_name(row.name, "install"), *extension_install_command(row.name, version, "install"))
+          row.update(state: "installing", last_transition_at: Time.now, last_error: nil)
+        end
+      when "restart_pending"
+        if resource.restart_unblocked?(postgres_server.id, row.name, version) && !postgres_server.restart_set?
+          poll_extension_phase(row, version, "post_restart")
+        end
+      end
+    end
+  end
+
+  def extension_unit_name(name, phase)
+    "extension_#{name}_#{phase}"
+  end
+
+  def extension_server_role
+    return "primary" if postgres_server.primary? && !resource.read_replica?
+    return "read_replica" if resource.read_replica?
+    "standby"
+  end
+
+  def extension_install_command(name, version, phase)
+    base_url = Config.postgres_extension_script_base_url
+    script_path = "/tmp/extension-install-#{name}-#{phase}.sh"
+    result_path = "/tmp/extension-result-#{name}.json"
+    env_args = {
+      "INSTALL_PHASE" => phase,
+      "INSTALL_NAME" => name,
+      "INSTALL_VERSION" => version,
+      "INSTALL_PG_MAJOR" => postgres_server.version,
+      "INSTALL_RESOURCE_ID" => resource.ubid,
+      "INSTALL_SERVER_ID" => postgres_server.id,
+      "INSTALL_SERVER_ROLE" => extension_server_role,
+      "INSTALL_SERVER_FLAVOR" => resource.flavor,
+      "INSTALL_RESOURCE_TAGS" => resource.tags.to_json,
+      "INSTALL_SCRIPT_BASE_URL" => base_url,
+      "INSTALL_RESULT_FILE" => result_path,
+    }.map { |k, v| "#{k}=#{v}" }
+    payload = "set -e; aws s3 cp '#{base_url}/#{name}/#{postgres_server.version}/install.sh' '#{script_path}' && bash '#{script_path}'"
+    ["env", *env_args, "/bin/bash", "-c", payload]
+  end
+
+  def poll_extension_phase(row, version, phase)
+    unit_name = extension_unit_name(row.name, phase)
+    case vm.sshable.d_check(unit_name)
+    when "NotStarted"
+      vm.sshable.d_run(unit_name, *extension_install_command(row.name, version, phase)) if phase == "post_restart"
+    when "InProgress"
+      # leave in place
+    when "Failed"
+      row.update(state: "failed", last_transition_at: Time.now, last_error: "#{phase} d_run failed")
+      vm.sshable.d_clean(unit_name)
+    when "Succeeded"
+      apply_extension_result(row, version, phase)
+      vm.sshable.d_clean(unit_name)
+    end
+  end
+
+  def apply_extension_result(row, version, phase)
+    result = JSON.parse(vm.sshable.cmd("cat /tmp/extension-result-:name.json", name: row.name))
+    if result["status"] != "ok"
+      Clog.emit("TODO remove: extension #{phase} -> failed", {server: postgres_server.ubid, ext: row.name, error: result["error"]})
+      row.update(state: "failed", last_transition_at: Time.now, last_error: result["error"])
+      return
+    end
+
+    if phase == "post_restart"
+      Clog.emit("TODO remove: extension post_restart -> ready", {server: postgres_server.ubid, ext: row.name})
+      row.update(state: "ready", last_transition_at: Time.now, last_error: nil)
+      return
+    end
+
+    config_entries = result["config_entries"] || {}
+    needs_restart = result["needs_restart"] || false
+    next_state = (config_entries.any? || needs_restart) ? "sync_pending" : "ready"
+    Clog.emit("TODO remove: extension install -> #{next_state}", {server: postgres_server.ubid, ext: row.name, version:, needs_restart:, primary_write: next_state == "sync_pending" && postgres_server.primary? && !resource.read_replica?})
+    DB.transaction do
+      row.update(state: next_state, installed_version: version, last_transition_at: Time.now, last_error: nil)
+      if next_state == "sync_pending" && postgres_server.primary? && !resource.read_replica?
+        new_config = resource.extension_config.merge(row.name => config_entries.merge("!needs_restart" => needs_restart, "!version" => version))
+        resource.update(extension_config: new_config)
+      end
+    end
+  rescue JSON::ParserError, Sshable::SshError => e
+    Clog.emit("TODO remove: extension #{phase} result unreadable -> failed", {server: postgres_server.ubid, ext: row.name, error: e.message[0..200]})
+    row.update(state: "failed", last_transition_at: Time.now, last_error: "result file unreadable: #{e.message[0..200]}")
+  end
+
   label def destroy
     decr_destroy
     Semaphore.incr(strand.children_dataset.exclude(prog: "Postgres::PostgresServerNexus").select(:id), "destroy")
@@ -989,5 +1128,14 @@ SQL
     end
 
     false
+  end
+
+  def drive_restart
+    register_deadline("complete_restart", 2 * 60)
+    if daemonized_restart
+      decr_restart
+      unregister_deadline("complete_restart")
+    end
+    nap 1
   end
 end

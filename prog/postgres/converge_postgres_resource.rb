@@ -25,6 +25,7 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
     hop_wait_servers_to_be_ready if postgres_resource.has_enough_fresh_servers?
 
     if postgres_resource.servers.all? { it.vm.vm_host } || !postgres_resource.location.metal?
+      nap 5 if postgres_resource.representative_server.needs_extension_converge?
       postgres_resource.provision_new_standby
     end
 

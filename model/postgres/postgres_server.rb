@@ -11,6 +11,7 @@ class PostgresServer < Sequel::Model
   many_to_one :resource, class: :PostgresResource
   many_to_one :timeline, class: :PostgresTimeline
   many_to_one :vm, read_only: true
+  one_to_many :extensions, class: :PostgresServerExtension, key: :postgres_server_id
 
   plugin ResourceMethods
   plugin ProviderDispatcher, __FILE__
@@ -18,7 +19,7 @@ class PostgresServer < Sequel::Model
     :restart, :configure, :fence, :unfence, :planned_take_over, :unplanned_take_over, :configure_metrics,
     :destroy, :recycle, :recycle_lagging_read_replica, :recycle_unavailable_server, :recycle_by_user_request,
     :promote_read_replica, :refresh_walg_credentials, :configure_s3_new_timeline, :lockout, :use_physical_slot,
-    :configure_logs, :ignore_instance_size_mismatch, :install_rhizome
+    :configure_logs, :ignore_instance_size_mismatch, :install_rhizome, :process_extensions
   include HealthMonitorMethods
   include MetricsTargetMethods
 
@@ -135,9 +136,16 @@ class PostgresServer < Sequel::Model
       add_provider_configs(configs)
     end
 
+    installed_extension_names = PostgresServerExtension
+      .where(postgres_server_id: id)
+      .exclude(installed_version: nil)
+      .select_map(:name)
+    extension_config = resource.effective_extension_config.slice(*installed_extension_names)
+
     {
       configs:,
       user_config:,
+      extension_config:,
       pgbouncer_user_config: resource.pgbouncer_user_config,
       physical_slots: caught_up_standbys&.map(&:ubid),
       private_subnets: vm.private_subnets.map {
@@ -209,6 +217,15 @@ class PostgresServer < Sequel::Model
 
   def read_replica?
     resource.read_replica?
+  end
+
+  def needs_extension_converge?
+    resource.effective_desired_extensions.any? do |name, version|
+      row = PostgresServerExtension.where(postgres_server_id: id, name:).first
+      !row ||
+        (row.state != "ready" && row.state != "failed") ||
+        (row.state == "ready" && row.installed_version != version)
+    end
   end
 
   def paradedb_and_primary?

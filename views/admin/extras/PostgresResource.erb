@@ -1,5 +1,48 @@
 <%# locals: (obj:) %>
 
+<% cluster_servers = obj.cluster_servers
+   extension_rows = PostgresServerExtension.where(postgres_server_id: cluster_servers.map(&:id)).all
+   by_server = extension_rows.group_by(&:postgres_server_id) %>
+
+<%== part("components/table",
+  title: "Desired Extensions",
+  table_class: "object-table",
+  data: obj.desired_extensions.map { |name, version| {"Name" => name, "Version" => version} }
+) %>
+
+<%== part("components/table",
+  title: "Extension Config (resource-level)",
+  table_class: "object-table",
+  data: obj.extension_config.map { |name, cfg| {"Name" => name, "Config" => Sequel.pg_jsonb_wrap(cfg)} }
+) %>
+
+<p>Per-server extension state:
+  <% cluster_servers.each do |s|
+       role = s.is_representative ? "rep" : (s.read_replica? ? "rr" : "standby") %>
+    <a href="/autoforme/PostgresServerExtension/search/1?postgres_server=<%= s.ubid %>"><%= s.ubid %> (<%= role %>)</a>
+  <% end %>
+</p>
+
+<%# TODO: remove the inline cluster roll-up table once the per-server links are sufficient %>
+<%== part("components/table",
+  title: "Per-Server Extension State (TODO: remove)",
+  table_class: "object-table",
+  data: cluster_servers.flat_map { |s|
+    rows = by_server[s.id] || []
+    role = s.is_representative ? "rep" : (s.read_replica? ? "rr" : "standby")
+    rows.map { |e|
+      {
+        "Server" => "#{s.ubid} (#{role})",
+        "Extension" => e.name,
+        "State" => e.state,
+        "Version" => e.installed_version,
+        "Last Transition" => e.last_transition_at&.strftime("%F %T"),
+        "Last Error" => e.last_error
+      }
+    }
+  }
+) %>
+
 <p>
   <a
     href="https://grafana.<%= Config.victoria_metrics_host_name %>/d/pg-dashboard/postgresql-metrics?orgId=1&from=now-12h&to=now&timezone=browser&var-data_source=aflgt0ufol81sa&var-ubid=<%= obj.ubid %>"

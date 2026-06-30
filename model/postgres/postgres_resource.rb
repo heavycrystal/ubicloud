@@ -27,8 +27,9 @@ class PostgresResource < Sequel::Model
     :destroy, :refresh_certificates, :use_different_az, :use_old_walg_command, :check_disk_usage,
     :storage_auto_scale_action_performed_80, :storage_auto_scale_action_performed_85, :storage_auto_scale_action_performed_90,
     :storage_auto_scale_canceled, :storage_auto_scale_not_cancellable, :skip_strict_memory_overcommit,
-    :bypass_maintenance_window
+    :bypass_maintenance_window, :converge_extensions
   include ObjectTag::Cleanup
+  include PostgresExtensionOrchestrationMethods
 
   ServerExclusionFilters = Struct.new(:exclude_host_ids, :exclude_data_centers, :exclude_availability_zones, :availability_zone)
 
@@ -61,7 +62,7 @@ class PostgresResource < Sequel::Model
     return "replaying_wal" if ["wait_catch_up", "wait_synchronization"].include?(server_strand_label)
     return "finalizing_restore" if server_strand_label == "wait_recovery_completion"
     return "restarting" if server_strand_label == "restart"
-    return "running" if ["wait", "refresh_certificates", "refresh_dns_record"].include?(strand.label) && !initial_provisioning_set?
+    return "running" if ["wait", "refresh_certificates", "refresh_dns_record", "converge_extensions", "watch_extension_apply", "trigger_extension_configure"].include?(strand.label) && !initial_provisioning_set?
 
     "creating"
   end
@@ -272,6 +273,18 @@ class PostgresResource < Sequel::Model
 
   def read_replica?
     parent_id && restore_target.nil?
+  end
+
+  def effective_desired_extensions
+    read_replica? ? parent.desired_extensions : desired_extensions
+  end
+
+  def effective_extension_config
+    read_replica? ? parent.extension_config : extension_config
+  end
+
+  def cluster_servers
+    servers + read_replicas.flat_map(&:servers)
   end
 
   def ongoing_failover?
