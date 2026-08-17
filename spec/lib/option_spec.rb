@@ -27,7 +27,12 @@ RSpec.describe Option do
 
   describe "GCP Postgres options" do
     it "defines all GCP family options" do
-      expect(Option::GCP_FAMILY_OPTIONS).to eq(["c4a-standard", "c4a-highmem"])
+      expect(Option::GCP_FAMILY_OPTIONS).to eq([
+        "c4a-standard", "c4a-highmem",
+        "c4-standard", "c4-highmem",
+        "c4d-standard", "c4d-highmem",
+        "z3-standardlssd", "z3-highlssd",
+      ])
     end
 
     it "includes GCP families in POSTGRES_FAMILY_OPTIONS" do
@@ -63,7 +68,16 @@ RSpec.describe Option do
 
     it "builds the GCE machine type from the family's prefix, vcpu count and suffix" do
       expect(described_class.gcp_instance_type_name("c4a-standard", 16)).to eq("c4a-standard-16-lssd")
-      expect(described_class.gcp_instance_type_name("c4a-highmem", 72)).to eq("c4a-highmem-72-lssd")
+      expect(described_class.gcp_instance_type_name("c4d-highmem", 96)).to eq("c4d-highmem-96-lssd")
+      expect(described_class.gcp_instance_type_name("z3-standardlssd", 44)).to eq("z3-highmem-44-standardlssd")
+      expect(described_class.gcp_instance_type_name("z3-highlssd", 32)).to eq("z3-highmem-32-highlssd")
+    end
+
+    it "terminates rather than live migrates above the local SSD migration limit" do
+      expect(described_class.gcp_on_host_maintenance("z3-highlssd", 44)).to eq("MIGRATE")
+      expect(described_class.gcp_on_host_maintenance("z3-highlssd", 88)).to eq("TERMINATE")
+      expect(described_class.gcp_on_host_maintenance("z3-standardlssd", 176)).to eq("TERMINATE")
+      expect(described_class.gcp_on_host_maintenance("c4-standard", 288)).to eq("MIGRATE")
     end
 
     it "raises rather than building a machine type for an unknown family" do
